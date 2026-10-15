@@ -21,7 +21,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /
 # diffusers pipeline from here — not its detectron2/densepose cloth_masker.
 RUN git clone --depth 1 https://github.com/Zheng-Chong/CatVTON.git /CatVTON
 
+# numpy MUST stay on 1.x: the base image's torch 2.1.1 is built against numpy 1 and
+# torch.from_numpy() raises "Numpy is not available" under numpy 2. Pin it first (and pin
+# opencv to a numpy-1-compatible wheel) so nothing silently upgrades numpy to 2.x.
 RUN pip install --no-cache-dir \
+      "numpy==1.26.4" \
       runpod \
       "diffusers==0.26.3" \
       "transformers==4.38.2" \
@@ -29,11 +33,13 @@ RUN pip install --no-cache-dir \
       "huggingface_hub==0.23.4" \
       hf_transfer \
       safetensors \
-      opencv-python-headless \
-      pillow \
-      numpy
+      "opencv-python-headless==4.9.0.80" \
+      pillow
 
-# sanity: the CatVTON pipeline imports cleanly against this diffusers version
+# sanity 1: numpy stayed on 1.x and torch<->numpy interop works (guards the torch 2.1 / numpy 2 trap)
+RUN python -c "import numpy, torch; print('numpy', numpy.__version__, 'torch', torch.__version__); assert numpy.__version__.startswith('1.'), 'numpy must be 1.x'; assert int(torch.from_numpy(numpy.arange(3)).sum())==3; print('numpy<->torch OK')"
+
+# sanity 2: the CatVTON pipeline imports cleanly against this diffusers version
 RUN python -c "import sys; sys.path.insert(0,'/CatVTON'); from model.pipeline import CatVTONPipeline; print('CatVTONPipeline import OK')"
 
 COPY handler.py /handler.py
