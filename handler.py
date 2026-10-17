@@ -108,19 +108,27 @@ def _garment_regions(garment_seg):
     full_length = has_lower and reaches > 0.70   # long trousers / maxi dress / long skirt
     if full_length:
         regions |= set(LEG_LABELS)               # let the garment be painted over the legs
+
+    # Sleeves: if the garment's top (upper-clothes / dress) covers the arms — i.e. few
+    # BARE arm pixels relative to the top's size — it is sleeved, so mask the person's
+    # arms too and the sleeves can actually be painted (not stuck at the model's cut).
+    upper = int(np.isin(garment_seg, [4, 7]).sum())
+    arms  = int(np.isin(garment_seg, ARM_LABELS).sum())
+    has_sleeves = upper > 50 and arms < 0.35 * upper
+    if has_sleeves:
+        regions |= set(ARM_LABELS)
     return regions, full_length
 
 
-def _agnostic_mask(person_img, garment_img, grow=12):
+def _agnostic_mask(person_img, garment_seg, grow=14):
     """
-    Garment-aware mask (white = repaint). Segments both images: the person to find the
-    body parts, the garment to decide how much of the body to cover. For a full-length
-    outfit it also covers the legs and bridges the waist/midriff gap so the garment is
-    continuous head-to-ankle.
+    Garment-aware mask (white = repaint). Uses the person parse for body parts and the
+    (already segmented) garment to decide how much of the body to cover — legs for a
+    full-length outfit, arms for a sleeved one — then bridges short vertical gaps (bare
+    midriff/waist) so a full outfit is painted continuously.
     """
     person_seg = _segment(person_img)
-    garment_seg = _segment(garment_img)
-    regions, full_length = _garment_regions(garment_seg)
+    regions, _ = _garment_regions(garment_seg)
 
     mask = (np.isin(person_seg, list(regions)).astype(np.uint8)) * 255
 
@@ -128,18 +136,30 @@ def _agnostic_mask(person_img, garment_img, grow=12):
         import cv2
         if grow and grow > 0:
             mask = cv2.dilate(mask, np.ones((grow, grow), np.uint8), iterations=1)
-        if full_length:
-            # Fill each column between its topmost and bottommost masked pixel. This
-            # bridges bare-skin gaps (midriff on a crop top, thigh above shorts) so the
-            # full outfit has a continuous region to be painted into, shoulders->ankles.
-            m = mask > 0
-            cols = np.where(m.any(axis=0))[0]
-            for c in cols:
-                r = np.where(m[:, c])[0]
-                mask[r.min():r.max() + 1, c] = 255
+        # Close SHORT vertical gaps (crop-top midriff, thigh above shorts) so a full
+        # outfit is continuous — but keep the kernel short enough that it never joins
+        # far-apart regions (e.g. a raised arm to the shoulder).
+        H = mask.shape[0]
+        kh = max(grow, int(H * 0.13))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((kh, max(grow, 8)), np.uint8))
     except Exception:
         pass
     return Image.fromarray(mask, mode="L")
+
+
+def _clean_garment(garment_img, garment_seg):
+    """
+    Isolate the garment onto a clean white background — drop the garment photo's model,
+    pose, face and room. CatVTON expects a flat packshot; handing it a full on-model photo
+    is the #1 cause of garment drift. Falls back to the original if segmentation is thin.
+    """
+    cloth = np.isin(garment_seg, CLOTH_LABELS)
+    if int(cloth.sum()) < 200:
+        return garment_img
+    arr = np.array(garment_img)
+    out = np.full_like(arr, 255)                 # white canvas
+    out[cloth] = arr[cloth]                       # keep only the garment pixels
+    return Image.fromarray(out)
 
 
 def handler(event):
@@ -150,21 +170,24 @@ def handler(event):
 
         person = _b64_to_img(inp["person"])
         garment = _b64_to_img(inp["garment"])
-        steps = int(inp.get("steps", 35))
-        guidance = float(inp.get("guidance_scale", 2.5))
-        grow = int(inp.get("mask_grow", 12))
+        steps = int(inp.get("steps", 40))
+        guidance = float(inp.get("guidance_scale", 3.5))
+        grow = int(inp.get("mask_grow", 14))
         seed = int(inp.get("seed", 42))
+        clean = bool(inp.get("clean_garment", True))   # isolate the garment onto white
         W, H = 768, 1024
 
         _load()
         person_r = person.resize((W, H))
         garment_r = garment.resize((W, H))
-        mask = _agnostic_mask(person_r, garment_r, grow=grow).resize((W, H))
+        garment_seg = _segment(garment_r)                      # segment the garment once
+        condition = _clean_garment(garment_r, garment_seg) if clean else garment_r
+        mask = _agnostic_mask(person_r, garment_seg, grow=grow).resize((W, H))
 
         gen = torch.Generator(device=DEVICE).manual_seed(seed)
         out = _pipe(
             image=person_r,
-            condition_image=garment_r,
+            condition_image=condition,
             mask=mask,
             num_inference_steps=steps,
             guidance_scale=guidance,
