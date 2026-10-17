@@ -43,15 +43,21 @@ _seg_proc = None
 _seg_model = None
 
 
-def _load():
-    """Lazy-load the models once per worker (kept warm in VRAM between jobs)."""
-    global _pipe, _seg_proc, _seg_model
+def _load_seg():
+    """Load only the segformer clothing parser (tiny) — used by the fast clean path."""
+    global _seg_proc, _seg_model
     if _seg_model is None:
         from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
         _seg_proc = SegformerImageProcessor.from_pretrained("mattmdjaga/segformer_b2_clothes")
         _seg_model = AutoModelForSemanticSegmentation.from_pretrained(
             "mattmdjaga/segformer_b2_clothes"
         ).to(DEVICE).eval()
+
+
+def _load():
+    """Lazy-load all models once per worker (kept warm in VRAM between jobs)."""
+    global _pipe
+    _load_seg()
     if _pipe is None:
         from model.pipeline import CatVTONPipeline
         _pipe = CatVTONPipeline(
@@ -162,9 +168,42 @@ def _clean_garment(garment_img, garment_seg):
     return Image.fromarray(out)
 
 
+def _clean_garment_packshot(garment_img, pad=0.08):
+    """
+    Isolate the garment onto a white background AND crop to it — a clean packshot.
+    Used by the clean_only path to strip the garment photo's model + scene so the
+    try-on engine keeps the SELLER's model and background, not the garment photo's.
+    """
+    _load_seg()
+    seg = _segment(garment_img)
+    cloth = np.isin(seg, CLOTH_LABELS)
+    if int(cloth.sum()) < 200:
+        return garment_img                        # couldn't segment: return as-is
+    arr = np.array(garment_img)
+    out = np.full_like(arr, 255)
+    out[cloth] = arr[cloth]
+    ys, xs = np.where(cloth)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    H, W = arr.shape[:2]
+    py, px = int((y1 - y0) * pad), int((x1 - x0) * pad)
+    y0 = max(0, y0 - py); y1 = min(H, y1 + py + 1)
+    x0 = max(0, x0 - px); x1 = min(W, x1 + px + 1)
+    return Image.fromarray(out[y0:y1, x0:x1])
+
+
 def handler(event):
     try:
         inp = event.get("input", {}) or {}
+
+        # Fast path: isolate the garment onto a white packshot (no diffusion). Used to
+        # pre-clean a garment photo (strip its model + scene) before a Qwen try-on.
+        if inp.get("clean_only"):
+            g = inp.get("garment") or inp.get("image")
+            if not g:
+                return {"error": "clean_only needs 'garment' (base64/dataURI)"}
+            cleaned = _clean_garment_packshot(_b64_to_img(g))
+            return {"image": _img_to_b64(cleaned)}
+
         if not inp.get("person") or not inp.get("garment"):
             return {"error": "need both 'person' and 'garment' (base64/dataURI)"}
 
